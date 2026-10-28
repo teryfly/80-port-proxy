@@ -38,14 +38,21 @@ RT=(--port "$PORT" --certs-dir "$CERTS")
 if [[ -n $HTTPSPORT ]]; then RT+=(--https-port "$HTTPSPORT"); else RT+=(--no-https); fi
 
 FALLBACK_HOST=probe-missing.invalid
-first=$(awk '!/^[[:space:]]*#/ && NF {print $1; exit}' routes.conf)
-probe_host=$first
-[[ $probe_host == \*.* ]] && probe_host="probe.${probe_host#*.}"
+# 自检按模式各探一条(通配符来源要换成一个具体子域, 那个字面值不会出现在 Host 头里)
+probe_of() { local s=$1; [[ $s == \*.* ]] && s="probe.${s#*.}"; printf '%s' "$s"; }
+entries=()
+seen_modes=""
+while IFS=$'\t' read -r src mode _upstream; do
+  [[ " $seen_modes " == *" $mode "* ]] && continue
+  seen_modes+=" $mode"
+  entries+=("$mode:$src")
+done < <(python3 render.py routes.conf --print-modes "${RT[@]}" 2>/dev/null || true)
 
-probe() { curl ${3:-} -s --noproxy '*' -o /dev/null -w '%{http_code} %{redirect_url}' -H "Host: $1" "$2" 2>/dev/null || true; }
+# --max-time 留在 curl 参数里: 转发规则的探测会真的打到上游, 上游卡住时不能拖住 status
+probe() { curl ${3:-} -s --noproxy '*' --max-time 3 -o /dev/null -w '%{http_code} %{redirect_url}' -H "Host: $1" "$2" 2>/dev/null || true; }
 # 指纹探兜底块: 第一条规则可能是通配符或 IP, 那种字面 Host 永远不命中
 live_ver() {  # $1=URL  $2=curl 额外参数(https 要 -k)
-  { curl ${2:-} -sSI --noproxy '*' -H "Host: $FALLBACK_HOST" "$1" 2>/dev/null || true; } \
+  { curl ${2:-} -sSI --noproxy '*' --max-time 3 -H "Host: $FALLBACK_HOST" "$1" 2>/dev/null || true; } \
     | tr -d '\r' | sed -n 's/^X-Rules-Version: //p'
 }
 shown() {
@@ -89,10 +96,21 @@ do_status() {
   fi
 
   echo "自检:"
-  printf '  %-11s 命中         -> %s\n'           "HTTP:$PORT" "$(probe "$probe_host" "http://127.0.0.1:$PORT/")"
-  printf '  %-11s 未配置 Host  -> %s (期望 400)\n' "HTTP:$PORT" "$(probe "$FALLBACK_HOST" "http://127.0.0.1:$PORT/")"
+  for entry in "${entries[@]}"; do
+    mode=${entry%%:*}; src=${entry#*:}; host=$(probe_of "$src")
+    if [[ $mode == proxy ]]; then
+      # 转发的状态码来自上游本身: 200/301/401 都算通, 502/504 说明上游没起来
+      printf '  %-11s %-16s 命中         -> %s (转发: 上游没起来时 502)\n' \
+        "HTTP:$PORT" "$mode:$src" "$(probe "$host" "http://127.0.0.1:$PORT/")"
+    else
+      printf '  %-11s %-16s 命中         -> %s (跳转: 期望 302)\n' \
+        "HTTP:$PORT" "$mode:$src" "$(probe "$host" "http://127.0.0.1:$PORT/")"
+    fi
+  done
+  printf '  %-11s %-16s 未配置 Host  -> %s (期望 400)\n' "HTTP:$PORT" "兜底" \
+    "$(probe "$FALLBACK_HOST" "http://127.0.0.1:$PORT/")"
   if [[ -n $HTTPSPORT ]]; then
-    printf '  %-11s 未配置 Host  -> %s (期望 400)\n' "HTTPS:$HTTPSPORT" \
+    printf '  %-11s %-16s 未配置 Host  -> %s (期望 400)\n' "HTTPS:$HTTPSPORT" "兜底" \
       "$(probe "$FALLBACK_HOST" "https://127.0.0.1:$HTTPSPORT/" -k)"
   fi
   echo "证书:"
